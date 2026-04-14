@@ -231,7 +231,9 @@ class _Emitter:
         return out
 
     def _stmt_var(self, node: A.VarDecl, depth: int) -> List[str]:
-        return [self.indent_unit * depth + self._render_var_decl(node)]
+        rendered = self._render_var_decl(node)
+        prefix = self.indent_unit * depth
+        return [prefix + line for line in rendered.split("\n")]
 
     def _stmt_expr(self, node: A.ExprStmt, depth: int) -> List[str]:
         return [self.indent_unit * depth + self.expr(node.expr)]
@@ -439,7 +441,14 @@ class _Emitter:
 
     def _render_unaryop(self, node: A.UnaryOp) -> str:
         op = node.op
-        py_op = {"!": "not ", "typeof": "type "}.get(op, op)
+        if op == "await":
+            # Sync-adapter: drop await. The translated code is called from
+            # a synchronous Python wrapper, so Promise-style awaits make no
+            # sense. Callers that relied on a resolved Promise will see the
+            # raw awaited expression.
+            return self.expr(node.operand)
+        py_op = {"!": "not ", "typeof": "type ", "void": "None or ",
+                 "delete": ""}.get(op, op + " ")
         if op in ("++", "--") and not node.prefix:
             # Post-increment as a statement-level tweak; we mimic by
             # returning the operand followed by '+=1' — only valid as

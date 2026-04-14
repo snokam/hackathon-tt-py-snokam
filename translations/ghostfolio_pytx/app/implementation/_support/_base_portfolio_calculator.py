@@ -21,17 +21,17 @@ class PortfolioCalculator:
 
 
     async def get_dividend_in_base_currency(self):
-        (awaitself.snapshot_promise)
+        self.snapshot_promise
         return get_sum(self.snapshot.positions.map((lambda _arg: dividend_in_base_currency)))
 
 
     async def get_fees_in_base_currency(self):
-        (awaitself.snapshot_promise)
+        self.snapshot_promise
         return self.snapshot.total_fees_with_currency_effect
 
 
     async def get_interest_in_base_currency(self):
-        (awaitself.snapshot_promise)
+        self.snapshot_promise
         return self.snapshot.total_interest_with_currency_effect
 
 
@@ -52,16 +52,16 @@ class PortfolioCalculator:
 
 
     async def get_liabilities_in_base_currency(self):
-        (awaitself.snapshot_promise)
+        self.snapshot_promise
         return self.snapshot.total_liabilities_with_currency_effect
 
 
     async def get_performance(self, _arg0):
         end = _arg0['end']
         start = _arg0['start']
-        (awaitself.snapshot_promise)
+        self.snapshot_promise
         _destr = self.snapshot
-historical_data = _destr['historical_data']
+        historical_data = _destr['historical_data']
         chart = []
         net_performance_at_start_date = None
         net_performance_with_currency_effect_at_start_date = None
@@ -82,7 +82,7 @@ historical_data = _destr['historical_data']
 
 
     async def get_snapshot(self):
-        (awaitself.snapshot_promise)
+        self.snapshot_promise
         return self.snapshot
 
 
@@ -182,10 +182,10 @@ historical_data = _destr['historical_data']
         is_cached_portfolio_snapshot_expired = False
         job_id = self.user_id
         try:
-            cached_portfolio_snapshot_value = (awaitself.redis_cache_service.get(self.redis_cache_service.get_portfolio_snapshot_key({'filters': self.filters, 'userId': self.user_id})))
+            cached_portfolio_snapshot_value = self.redis_cache_service.get(self.redis_cache_service.get_portfolio_snapshot_key({'filters': self.filters, 'userId': self.user_id}))
             _destr = JSON.parse(cached_portfolio_snapshot_value)
-expiration = _destr['expiration']
-portfolio_snapshot = _destr['portfolio_snapshot']
+            expiration = _destr['expiration']
+            portfolio_snapshot = _destr['portfolio_snapshot']
             cached_portfolio_snapshot = plain_to_class(portfolio_snapshot, portfolio_snapshot)
             if is_after(date(), date(expiration)):
                 is_cached_portfolio_snapshot_expired = True
@@ -197,10 +197,10 @@ portfolio_snapshot = _destr['portfolio_snapshot']
             if is_cached_portfolio_snapshot_expired:
                 self.portfolio_snapshot_service.add_job_to_queue({'data': {'calculationType': self.get_performance_calculation_type(), 'filters': self.filters, 'userCurrency': self.currency, 'userId': self.user_id}, 'name': PORTFOLIO_SNAPSHOT_PROCESS_JOB_NAME, 'opts': {**PORTFOLIO_SNAPSHOT_PROCESS_JOB_OPTIONS, 'jobId': job_id, 'priority': PORTFOLIO_SNAPSHOT_COMPUTATION_QUEUE_PRIORITY_LOW}})
         else:
-            (awaitself.portfolio_snapshot_service.add_job_to_queue({'data': {'calculationType': self.get_performance_calculation_type(), 'filters': self.filters, 'userCurrency': self.currency, 'userId': self.user_id}, 'name': PORTFOLIO_SNAPSHOT_PROCESS_JOB_NAME, 'opts': {**PORTFOLIO_SNAPSHOT_PROCESS_JOB_OPTIONS, 'jobId': job_id, 'priority': PORTFOLIO_SNAPSHOT_COMPUTATION_QUEUE_PRIORITY_HIGH}}))
-            job = (awaitself.portfolio_snapshot_service.get_job(job_id))
+            self.portfolio_snapshot_service.add_job_to_queue({'data': {'calculationType': self.get_performance_calculation_type(), 'filters': self.filters, 'userCurrency': self.currency, 'userId': self.user_id}, 'name': PORTFOLIO_SNAPSHOT_PROCESS_JOB_NAME, 'opts': {**PORTFOLIO_SNAPSHOT_PROCESS_JOB_OPTIONS, 'jobId': job_id, 'priority': PORTFOLIO_SNAPSHOT_COMPUTATION_QUEUE_PRIORITY_HIGH}})
+            job = self.portfolio_snapshot_service.get_job(job_id)
             if job:
-                (awaitjob.finished())
-            (awaitself.initialize())
+                job.finished()
+            self.initialize()
 
 
