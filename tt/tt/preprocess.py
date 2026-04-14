@@ -9,6 +9,7 @@ tokens can usually still be parsed but mangled output cannot.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import re
 from typing import List, Tuple
 
@@ -59,6 +60,13 @@ def _skip_comment(src: str, i: int) -> int:
     return i
 
 
+def _skip_opaque(src: str, i: int) -> int:
+    """Skip a string or comment starting at ``src[i]`` if present."""
+    if src[i] in ("'", '"', "`"):
+        return _skip_string(src, i)
+    return _skip_comment(src, i)
+
+
 # ------------------------- scan-based stripping passes -------------------------
 
 
@@ -84,6 +92,38 @@ def _strip_imports_of_type(src: str) -> str:
                   "", src, flags=re.MULTILINE)
 
 
+def _find_next_brace(src: str, i: int) -> int:
+    """Return the next real ``{`` at or after ``i``."""
+    n = len(src)
+    while i < n:
+        ni = _skip_opaque(src, i)
+        if ni != i:
+            i = ni
+            continue
+        if src[i] == "{":
+            return i
+        i += 1
+    return n
+
+
+def _scan_balanced_braces(src: str, i: int) -> int:
+    """Return the position just past the balanced block starting at ``i``."""
+    n = len(src)
+    depth = 1
+    j = i + 1
+    while j < n and depth:
+        nj = _skip_opaque(src, j)
+        if nj != j:
+            j = nj
+            continue
+        if src[j] == "{":
+            depth += 1
+        elif src[j] == "}":
+            depth -= 1
+        j += 1
+    return j
+
+
 def _strip_balanced_block(src: str, header_re: re.Pattern) -> str:
     """Remove constructs whose header is matched by ``header_re`` and whose
     body is the next ``{...}`` block (string-aware)."""
@@ -91,41 +131,33 @@ def _strip_balanced_block(src: str, header_re: re.Pattern) -> str:
         m = header_re.search(src)
         if not m:
             return src
-        # Find first '{' after the match, skipping strings/comments.
-        i = m.end()
-        n = len(src)
-        while i < n:
-            c = src[i]
-            if c in ("'", '"', "`"):
-                i = _skip_string(src, i)
-                continue
-            ni = _skip_comment(src, i)
-            if ni != i:
-                i = ni
-                continue
-            if c == "{":
-                break
-            i += 1
-        if i >= n:
+        i = _find_next_brace(src, m.end())
+        if i >= len(src):
             return src
-        # Scan balanced.
-        depth = 1
-        j = i + 1
-        while j < n and depth:
-            c = src[j]
-            if c in ("'", '"', "`"):
-                j = _skip_string(src, j)
-                continue
-            nj = _skip_comment(src, j)
-            if nj != j:
-                j = nj
-                continue
-            if c == "{":
-                depth += 1
-            elif c == "}":
-                depth -= 1
-            j += 1
+        j = _scan_balanced_braces(src, i)
         src = src[: m.start()] + src[j:]
+
+
+def _scan_type_alias_end(src: str, j: int) -> int:
+    """Return the end position of a ``type Foo = ...`` alias."""
+    n = len(src)
+    depth = 0
+    while j < n:
+        nj = _skip_opaque(src, j)
+        if nj != j:
+            j = nj
+            continue
+        c = src[j]
+        if c in "({[<":
+            depth += 1
+        elif c in ")}]>":
+            if depth == 0:
+                return j
+            depth -= 1
+        elif depth == 0 and c in ";\n":
+            return j + 1
+        j += 1
+    return j
 
 
 def _strip_type_aliases(src: str) -> str:
@@ -138,31 +170,7 @@ def _strip_type_aliases(src: str) -> str:
         m = pattern.search(src)
         if not m:
             return src
-        j = m.end()
-        n = len(src)
-        depth = 0
-        while j < n:
-            c = src[j]
-            if c in ("'", '"', "`"):
-                j = _skip_string(src, j)
-                continue
-            nj = _skip_comment(src, j)
-            if nj != j:
-                j = nj
-                continue
-            if c in "({[<":
-                depth += 1
-            elif c in ")}]>":
-                if depth == 0:
-                    break
-                depth -= 1
-            elif depth == 0 and c == ";":
-                j += 1
-                break
-            elif depth == 0 and c == "\n":
-                j += 1
-                break
-            j += 1
+        j = _scan_type_alias_end(src, m.end())
         src = src[: m.start()] + src[j:]
 
 
@@ -183,6 +191,81 @@ def _annot_needs_brace(src: str, i: int) -> bool:
     return i < n and src[i] == "{"
 
 
+def _type_ref_stop_at_top(
+    src: str,
+    i: int,
+    depths: Tuple[int, int, int, int],
+    allow_brace: bool,
+) -> int | None:
+    """Return a stop position before consuming ``src[i]`` if needed."""
+    depth_angle, depth_paren, depth_brace, depth_brack = depths
+    c = src[i]
+    if c == ">" and depth_angle == 0:
+        return i
+    if c == ")" and depth_paren == 0:
+        return i
+    if c == "]" and depth_brack == 0:
+        return i
+    if c == "{" and depth_brace == 0 and not allow_brace:
+        return i
+    if c == "}" and depth_brace == 0:
+        return i
+    if depth_angle == depth_paren == depth_brace == depth_brack == 0 and c in ",;=\n":
+        return i
+    return None
+
+
+def _type_ref_update_depths(
+    c: str,
+    depths: Tuple[int, int, int, int],
+) -> Tuple[int, int, int, int]:
+    """Advance bracket depths for one consumed type-expression character."""
+    depth_angle, depth_paren, depth_brace, depth_brack = depths
+    if c == "<":
+        depth_angle += 1
+    elif c == ">":
+        depth_angle -= 1
+    elif c == "(":
+        depth_paren += 1
+    elif c == ")":
+        depth_paren -= 1
+    elif c == "[":
+        depth_brack += 1
+    elif c == "]":
+        depth_brack -= 1
+    elif c == "{":
+        depth_brace += 1
+    elif c == "}":
+        depth_brace -= 1
+    return (depth_angle, depth_paren, depth_brace, depth_brack)
+
+
+def _type_ref_following_suffix(src: str, i: int) -> int:
+    """Return the position after any whitespace following a completed suffix."""
+    n = len(src)
+    while i < n and src[i] in " \t\r\n":
+        i += 1
+    return i
+
+
+def _type_ref_suffix_stop(
+    src: str,
+    i: int,
+    c: str,
+    depths: Tuple[int, int, int, int],
+) -> int | None:
+    """Stop after a top-level ``]`` or ``}`` unless the type clearly continues."""
+    depth_angle, depth_paren, depth_brace, depth_brack = depths
+    if c not in ("]", "}"):
+        return None
+    if depth_angle or depth_paren or depth_brace or depth_brack:
+        return None
+    j = _type_ref_following_suffix(src, i)
+    if j >= len(src) or src[j] not in "&|[":
+        return j
+    return None
+
+
 def _scan_type_ref(src: str, i: int, allow_brace: bool = False) -> int:
     """Return position just past a TS type reference starting at ``i``.
 
@@ -195,68 +278,175 @@ def _scan_type_ref(src: str, i: int, allow_brace: bool = False) -> int:
     object types; otherwise we stop at ``{``.
     """
     n = len(src)
-    depth_angle = 0
-    depth_paren = 0
-    depth_brace = 0
-    depth_brack = 0
+    depths = (0, 0, 0, 0)
     while i < n:
-        # Skip strings/comments — types may include string literals via
-        # template-literal types; we treat them opaquely.
-        c = src[i]
-        if c in ("'", '"', "`"):
-            i = _skip_string(src, i)
-            continue
-        ni = _skip_comment(src, i)
+        ni = _skip_opaque(src, i)
         if ni != i:
             i = ni
             continue
-        if c == "<":
-            depth_angle += 1
-        elif c == ">":
-            if depth_angle == 0:
-                return i
-            depth_angle -= 1
-        elif c == "(":
-            depth_paren += 1
-        elif c == ")":
-            if depth_paren == 0:
-                return i
-            depth_paren -= 1
-        elif c == "[":
-            depth_brack += 1
-        elif c == "]":
-            if depth_brack == 0:
-                return i
-            depth_brack -= 1
-            if depth_brack == 0 and depth_angle == depth_paren == depth_brace == 0:
-                # After an array-type suffix, `{` is not part of the type.
-                j = i + 1
-                while j < n and src[j] in " \t\r\n":
-                    j += 1
-                if j >= n or src[j] not in "&|[":
-                    return j
-        elif c == "{":
-            if not allow_brace and depth_brace == 0:
-                return i
-            depth_brace += 1
-        elif c == "}":
-            if depth_brace == 0:
-                return i
-            depth_brace -= 1
-            if depth_brace == 0 and depth_angle == depth_paren == depth_brack == 0:
-                # After closing a top-level type object, only continue if the
-                # next non-whitespace char extends the type (`&`, `|`, `[`).
-                # Anything else (especially another `{`) is the enclosing body.
-                j = i + 1
-                while j < n and src[j] in " \t\r\n":
-                    j += 1
-                if j >= n or src[j] not in "&|[":
-                    return j
-        elif depth_angle == depth_paren == depth_brace == depth_brack == 0:
-            if c in ",;=\n":
-                return i
+        stop = _type_ref_stop_at_top(src, i, depths, allow_brace)
+        if stop is not None:
+            return stop
+        c = src[i]
+        depths = _type_ref_update_depths(c, depths)
         i += 1
+        stop = _type_ref_suffix_stop(src, i, c, depths)
+        if stop is not None:
+            return stop
     return i
+
+
+@dataclass
+class _AnnotationState:
+    out: List[str]
+    stack: List[Tuple[str, str]]
+    tern_stack: List[int]
+    i: int = 0
+
+
+def _annotation_peek_non_ws(src: str, k: int) -> str:
+    while k < len(src) and src[k] in " \t\r\n":
+        k += 1
+    return src[k] if k < len(src) else ""
+
+
+def _annotation_prev_sig(out: List[str]) -> str:
+    k = len(out) - 1
+    while k >= 0 and out[k].isspace():
+        k -= 1
+    return out[k] if k >= 0 else ""
+
+
+def _annotation_prev_word(out: List[str]) -> str:
+    text = "".join(out)
+    m = re.search(r"([A-Za-z_$][\w$]*)\s*$", text)
+    return m.group(1) if m else ""
+
+
+def _annotation_copy_opaque(src: str, state: _AnnotationState) -> bool:
+    i = state.i
+    if src[i] in ("'", '"', "`"):
+        j = _skip_string(src, i)
+        state.out.append(src[i:j])
+        state.i = j
+        return True
+    nj = _skip_comment(src, i)
+    if nj == i:
+        return False
+    state.out.append(src[i:nj])
+    state.i = nj
+    return True
+
+
+def _annotation_brace_context(out: List[str]) -> str:
+    tail = "".join(out).rstrip()
+    if tail.endswith(("=>", "else", "do", "try", "finally")):
+        return "block"
+    return "block" if _annotation_prev_sig(out) in ("", ")", "}", ";", "{") else "object"
+
+
+def _annotation_open_context(src: str, state: _AnnotationState) -> bool:
+    c = src[state.i]
+    if c == "(":
+        ctx = ("paren", "")
+    elif c == "[":
+        ctx = ("brack", "")
+    elif c == "{":
+        ctx = ("brace", _annotation_brace_context(state.out))
+    else:
+        return False
+    state.stack.append(ctx)
+    state.tern_stack.append(0)
+    state.out.append(c)
+    state.i += 1
+    return True
+
+
+def _annotation_maybe_consume_return_type(src: str, state: _AnnotationState) -> None:
+    if state.tern_stack[-1] != 0:
+        return
+    k = state.i
+    while k < len(src) and src[k] in " \t":
+        k += 1
+    if k >= len(src) or src[k] != ":":
+        return
+    end = _scan_type_ref(src, k + 1, allow_brace=_annot_needs_brace(src, k + 1))
+    j = _type_ref_following_suffix(src, end)
+    if j < len(src) and (src[j] == "{" or src[j] == ";" or src[j:j + 2] == "=>"):
+        state.i = end
+
+
+def _annotation_close_context(src: str, state: _AnnotationState) -> bool:
+    c = src[state.i]
+    if c not in ")]}":
+        return False
+    if state.stack:
+        state.stack.pop()
+    if len(state.tern_stack) > 1:
+        state.tern_stack.pop()
+    state.out.append(c)
+    state.i += 1
+    if c == ")":
+        _annotation_maybe_consume_return_type(src, state)
+    return True
+
+
+def _annotation_handle_question(src: str, state: _AnnotationState) -> bool:
+    if src[state.i] != "?":
+        return False
+    nxt = src[state.i + 1] if state.i + 1 < len(src) else ""
+    if nxt == "?":
+        state.out.append(src[state.i : state.i + 2])
+        state.i += 2
+        return True
+    if nxt == "." or _annotation_peek_non_ws(src, state.i + 1) == ":":
+        state.out.append("?")
+        state.i += 1
+        return True
+    state.tern_stack[-1] += 1
+    state.out.append("?")
+    state.i += 1
+    return True
+
+
+def _annotation_block_binding_tail(out: List[str]) -> bool:
+    tail = "".join(out)
+    if re.search(r"\?\s*[\w$\(\[]+\s*$", tail):
+        return False
+    return bool(
+        re.search(
+            r"(?:^|[^\w$])(let|const|var)\b[^;]{0,200}[\w$\)\]\}]\s*$",
+            tail,
+        )
+    )
+
+
+def _annotation_is_type_colon(state: _AnnotationState) -> bool:
+    ctx_kind, ctx_info = state.stack[-1] if state.stack else ("top", "")
+    if ctx_kind == "paren":
+        return True
+    if ctx_kind == "top":
+        prev_word = _annotation_prev_word(state.out)
+        return bool(prev_word and prev_word not in ("case", "default", "return"))
+    if ctx_kind == "brace" and ctx_info == "block":
+        if _annotation_block_binding_tail(state.out):
+            return True
+        return False
+    return False
+
+
+def _annotation_handle_colon(src: str, state: _AnnotationState) -> bool:
+    if src[state.i] != ":":
+        return False
+    if state.tern_stack[-1] > 0:
+        state.tern_stack[-1] -= 1
+        state.out.append(":")
+        state.i += 1
+        return True
+    if not _annotation_is_type_colon(state):
+        return False
+    state.i = _scan_type_ref(src, state.i + 1, allow_brace=True)
+    return True
 
 
 def _strip_type_annotations(src: str) -> str:
@@ -272,175 +462,21 @@ def _strip_type_annotations(src: str) -> str:
     literals — we recognize them when `{` follows `=`, `(`, `,`, `:`, `?`, or
     `return`.
     """
-    n = len(src)
-    out: List[str] = []
-    i = 0
-    # Stack of contexts: 'paren-params', 'paren-call', 'object', 'block', 'class-body'.
-    # Lightweight: we mostly just need to know paren vs object.
-    # We'll track a simplified stack of opening chars + a flag.
-    stack: List[Tuple[str, str]] = []  # (kind, info)
-    # Parallel stack of pending (unmatched) ternary `?` counts at each
-    # bracket depth. `:` consumes the topmost pending ternary before being
-    # considered as a type annotation — prevents mis-stripping expressions
-    # like `x ? a : b` inside parens/blocks.
-    tern_stack: List[int] = [0]
-
-    def peek_non_ws(k: int) -> str:
-        while k < n and src[k] in " \t\r\n":
-            k += 1
-        return src[k] if k < n else ""
-
-    def prev_sig() -> str:
-        k = len(out) - 1
-        while k >= 0 and out[k].isspace():
-            k -= 1
-        return out[k] if k >= 0 else ""
-
-    def prev_word() -> str:
-        # Find the previous identifier-like word in `out`.
-        text = "".join(out)
-        m = re.search(r"([A-Za-z_$][\w$]*)\s*$", text)
-        return m.group(1) if m else ""
-
-    while i < n:
-        c = src[i]
-        # Strings / comments — copy verbatim.
-        if c in ("'", '"', "`"):
-            j = _skip_string(src, i)
-            out.append(src[i:j])
-            i = j
+    state = _AnnotationState(out=[], stack=[], tern_stack=[0])
+    while state.i < len(src):
+        if _annotation_copy_opaque(src, state):
             continue
-        nj = _skip_comment(src, i)
-        if nj != i:
-            out.append(src[i:nj])
-            i = nj
+        if _annotation_open_context(src, state):
             continue
-        if c == "(":
-            stack.append(("paren", ""))
-            tern_stack.append(0)
-            out.append(c)
-            i += 1
+        if _annotation_close_context(src, state):
             continue
-        if c == "[":
-            stack.append(("brack", ""))
-            tern_stack.append(0)
-            out.append(c)
-            i += 1
+        if _annotation_handle_question(src, state):
             continue
-        if c == "{":
-            p = prev_sig()
-            ctx = "block" if p in ("", ")", "}", ";", "{") else "object"
-            # `else {` / `do {` / `try {` / `=> {` -> block.
-            # `=> {` is block too — keyword detection:
-            tail = "".join(out).rstrip()
-            if tail.endswith("=>") or tail.endswith("else") or tail.endswith("do") \
-               or tail.endswith("try") or tail.endswith("finally"):
-                ctx = "block"
-            stack.append(("brace", ctx))
-            tern_stack.append(0)
-            out.append(c)
-            i += 1
+        if _annotation_handle_colon(src, state):
             continue
-        if c in ")]}":
-            if stack:
-                stack.pop()
-            if len(tern_stack) > 1:
-                tern_stack.pop()
-            out.append(c)
-            i += 1
-            # After ')' check for return-type annotation. Skip if a ternary
-            # is pending in the enclosing scope — that `:` is the alternative
-            # branch, not a type annotation.
-            if c == ")" and tern_stack[-1] == 0:
-                k = i
-                while k < n and src[k] in " \t":
-                    k += 1
-                if k < n and src[k] == ":":
-                    end = _scan_type_ref(src, k + 1, allow_brace=_annot_needs_brace(src, k + 1))
-                    # Only consume if it really looks like a return-type: the
-                    # type must be followed by `{` (body), `;` (abstract), or
-                    # `=>` (arrow).
-                    j = end
-                    while j < n and src[j] in " \t\r\n":
-                        j += 1
-                    if j < n and (src[j] == "{" or src[j] == ";"
-                                  or src[j:j + 2] == "=>"):
-                        i = end
-            continue
-        if c == "?":
-            # Distinguish ternary `?` from `?.`, `??`, and optional-param `?:`.
-            nxt = src[i + 1] if i + 1 < n else ""
-            if nxt == "?":
-                # `??` nullish coalescing — consume BOTH chars atomically.
-                out.append(src[i:i + 2])
-                i += 2
-                continue
-            if nxt == ".":
-                # `?.` optional chaining.
-                out.append(c)
-                i += 1
-                continue
-            # Optional-param marker `?:` — peek past whitespace.
-            if peek_non_ws(i + 1) == ":":
-                out.append(c)
-                i += 1
-                continue
-            tern_stack[-1] += 1
-            out.append(c)
-            i += 1
-            continue
-        if c == ":":
-            # Ternary colon: balances a pending `?` — never an annotation.
-            if tern_stack[-1] > 0:
-                tern_stack[-1] -= 1
-                out.append(c)
-                i += 1
-                continue
-            # Determine if this colon is an annotation.
-            ctx_kind = stack[-1][0] if stack else "top"
-            ctx_info = stack[-1][1] if stack else ""
-            is_annotation = False
-            if ctx_kind == "paren":
-                is_annotation = True
-            elif ctx_kind == "top":
-                # After var-decl binding or class-field binding. We assume
-                # annotation when previous non-space chunk is an identifier.
-                pw = prev_word()
-                if pw and pw not in ("case", "default", "return"):
-                    is_annotation = True
-            elif ctx_kind == "brace" and ctx_info == "block":
-                # Inside a function body / class body. Could be an annotation
-                # for a local var, OR a label, OR a ternary's `:` (in expr).
-                # We're conservative: only strip when previous word is an ident
-                # AND the `:` is preceded by something resembling a binding —
-                # easier proxy: previous *meaningful* non-ident token is one
-                # of `let`/`const`/`var`/`,` (after a binding list) or `}` (
-                # destructuring close).  Use a regex on tail.
-                tail = "".join(out)
-                # Match "(let|const|var)\s+...\s*<ident>\s*$" with optional
-                # destructuring brackets in between.
-                if re.search(r"(?:^|[^\w$])(let|const|var)\b[^;]{0,200}[\w$\)\]\}]\s*$",
-                             tail) and not re.search(r"\?\s*[\w$\(\[]+\s*$", tail):
-                    # The negative lookbehind tries to reject ternary tails
-                    # that look like `cond ? a`. Crude but practical.
-                    is_annotation = True
-                elif tail.rstrip().endswith(")"):
-                    # method/function signature return annotation that the
-                    # `)`-handler already covers; here ignore.
-                    is_annotation = False
-            elif ctx_kind == "brace" and ctx_info == "object":
-                is_annotation = False  # object-literal colon — KEEP.
-            elif ctx_kind == "brack":
-                is_annotation = False
-            if is_annotation:
-                # Always allow braces for non-return annotations — terminator
-                # is `,`, `)`, `=`, `;`, or newline, never `{`.
-                end = _scan_type_ref(src, i + 1, allow_brace=True)
-                i = end
-                continue
-        out.append(c)
-        i += 1
-    return "".join(out)
+        state.out.append(src[state.i])
+        state.i += 1
+    return "".join(state.out)
 
 
 def _strip_optional_param_marks(src: str) -> str:
@@ -498,6 +534,37 @@ def _strip_export_keywords(src: str) -> str:
     return src
 
 
+def _scan_generic_param_block(src: str, i: int) -> int | None:
+    """Return the end of a generic ``<...>`` block, or None if it looks unsafe."""
+    n = len(src)
+    depth = 1
+    j = i + 1
+    while j < n and depth:
+        nj = _skip_opaque(src, j)
+        if nj != j:
+            j = nj
+            continue
+        c = src[j]
+        if c == "<":
+            depth += 1
+        elif c == ">":
+            depth -= 1
+        elif c in ";{}\n" or (c == "=" and j + 1 < n and src[j + 1] == ">"):
+            return None
+        j += 1
+    if depth != 0:
+        return None
+    inner = src[i + 1 : j - 1]
+    if any(tok in inner for tok in ("&&", "||", "==", "!=")):
+        return None
+    follow = src[j : j + 1]
+    if follow and follow not in "(){}[],;.:?=\n\t " and not follow.isspace():
+        return None
+    if not re.fullmatch(r"[\w\s,\.\[\]\|\&\?<>\-:'\"]*", inner or ""):
+        return None
+    return j
+
+
 def _strip_generic_params(src: str) -> str:
     """Remove generic angle-bracket parameter lists in declaration positions.
 
@@ -512,52 +579,17 @@ def _strip_generic_params(src: str) -> str:
     out: List[str] = []
     i = 0
     while i < n:
-        c = src[i]
-        if c in ("'", '"', "`"):
-            j = _skip_string(src, i)
-            out.append(src[i:j])
-            i = j
-            continue
-        nj = _skip_comment(src, i)
+        nj = _skip_opaque(src, i)
         if nj != i:
             out.append(src[i:nj])
             i = nj
             continue
+        c = src[i]
         if c == "<" and out and (_is_ident_char(out[-1]) or out[-1] == ">"):
-            depth = 1
-            j = i + 1
-            ok = True
-            while j < n and depth:
-                cj = src[j]
-                if cj in ("'", '"', "`"):
-                    j = _skip_string(src, j)
-                    continue
-                if cj == "<":
-                    depth += 1
-                elif cj == ">":
-                    depth -= 1
-                elif cj in ";{}\n":
-                    ok = False
-                    break
-                elif cj == "=" and j + 1 < n and src[j + 1] == ">":
-                    ok = False
-                    break
-                j += 1
-            if ok and depth == 0:
-                inner = src[i + 1 : j - 1]
-                if any(tok in inner for tok in ("&&", "||", "==", "!=")):
-                    out.append(c)
-                    i += 1
-                    continue
-                # Lookahead requirement to suppress comparisons like `a<b>c`:
-                follow = src[j : j + 1]
-                if follow and follow not in "(){}[],;.:?=\n\t " and not follow.isspace():
-                    out.append(c)
-                    i += 1
-                    continue
-                if re.fullmatch(r"[\w\s,\.\[\]\|\&\?<>\-:'\"]*", inner or ""):
-                    i = j
-                    continue
+            end = _scan_generic_param_block(src, i)
+            if end is not None:
+                i = end
+                continue
         out.append(c)
         i += 1
     return "".join(out)
