@@ -170,6 +170,19 @@ def _is_ident_char(c: str) -> bool:
     return c.isalnum() or c == "_" or c == "$"
 
 
+def _annot_needs_brace(src: str, i: int) -> bool:
+    """True if the type annotation starting at ``i`` begins with ``{``.
+
+    Used to decide whether ``_scan_type_ref`` should descend into an
+    inline object type (e.g. ``: { a: number } & Other``) without
+    mistakenly eating a following function body.
+    """
+    n = len(src)
+    while i < n and src[i] in " \t\r\n":
+        i += 1
+    return i < n and src[i] == "{"
+
+
 def _scan_type_ref(src: str, i: int, allow_brace: bool = False) -> int:
     """Return position just past a TS type reference starting at ``i``.
 
@@ -250,6 +263,16 @@ def _strip_type_annotations(src: str) -> str:
     # Lightweight: we mostly just need to know paren vs object.
     # We'll track a simplified stack of opening chars + a flag.
     stack: List[Tuple[str, str]] = []  # (kind, info)
+    # Parallel stack of pending (unmatched) ternary `?` counts at each
+    # bracket depth. `:` consumes the topmost pending ternary before being
+    # considered as a type annotation — prevents mis-stripping expressions
+    # like `x ? a : b` inside parens/blocks.
+    tern_stack: List[int] = [0]
+
+    def peek_non_ws(k: int) -> str:
+        while k < n and src[k] in " \t\r\n":
+            k += 1
+        return src[k] if k < n else ""
 
     def prev_sig() -> str:
         k = len(out) - 1
@@ -278,11 +301,13 @@ def _strip_type_annotations(src: str) -> str:
             continue
         if c == "(":
             stack.append(("paren", ""))
+            tern_stack.append(0)
             out.append(c)
             i += 1
             continue
         if c == "[":
             stack.append(("brack", ""))
+            tern_stack.append(0)
             out.append(c)
             i += 1
             continue
@@ -296,12 +321,15 @@ def _strip_type_annotations(src: str) -> str:
                or tail.endswith("try") or tail.endswith("finally"):
                 ctx = "block"
             stack.append(("brace", ctx))
+            tern_stack.append(0)
             out.append(c)
             i += 1
             continue
         if c in ")]}":
             if stack:
                 stack.pop()
+            if len(tern_stack) > 1:
+                tern_stack.pop()
             out.append(c)
             i += 1
             # After ')' check for return-type annotation.
@@ -310,10 +338,33 @@ def _strip_type_annotations(src: str) -> str:
                 while k < n and src[k] in " \t":
                     k += 1
                 if k < n and src[k] == ":":
-                    end = _scan_type_ref(src, k + 1)
+                    end = _scan_type_ref(src, k + 1, allow_brace=_annot_needs_brace(src, k + 1))
                     i = end
             continue
+        if c == "?":
+            # Distinguish ternary `?` from `?.`, `??`, and optional-param `?:`.
+            nxt = src[i + 1] if i + 1 < n else ""
+            if nxt in ("?", "."):
+                # `??` / `?.` — consume as-is, not a ternary.
+                out.append(c)
+                i += 1
+                continue
+            # Optional-param marker `?:` — peek past whitespace.
+            if peek_non_ws(i + 1) == ":":
+                out.append(c)
+                i += 1
+                continue
+            tern_stack[-1] += 1
+            out.append(c)
+            i += 1
+            continue
         if c == ":":
+            # Ternary colon: balances a pending `?` — never an annotation.
+            if tern_stack[-1] > 0:
+                tern_stack[-1] -= 1
+                out.append(c)
+                i += 1
+                continue
             # Determine if this colon is an annotation.
             ctx_kind = stack[-1][0] if stack else "top"
             ctx_info = stack[-1][1] if stack else ""
@@ -351,7 +402,7 @@ def _strip_type_annotations(src: str) -> str:
             elif ctx_kind == "brack":
                 is_annotation = False
             if is_annotation:
-                end = _scan_type_ref(src, i + 1)
+                end = _scan_type_ref(src, i + 1, allow_brace=_annot_needs_brace(src, i + 1))
                 i = end
                 continue
         out.append(c)
