@@ -228,6 +228,13 @@ def _scan_type_ref(src: str, i: int, allow_brace: bool = False) -> int:
             if depth_brack == 0:
                 return i
             depth_brack -= 1
+            if depth_brack == 0 and depth_angle == depth_paren == depth_brace == 0:
+                # After an array-type suffix, `{` is not part of the type.
+                j = i + 1
+                while j < n and src[j] in " \t\r\n":
+                    j += 1
+                if j >= n or src[j] not in "&|[":
+                    return j
         elif c == "{":
             if not allow_brace and depth_brace == 0:
                 return i
@@ -236,6 +243,15 @@ def _scan_type_ref(src: str, i: int, allow_brace: bool = False) -> int:
             if depth_brace == 0:
                 return i
             depth_brace -= 1
+            if depth_brace == 0 and depth_angle == depth_paren == depth_brack == 0:
+                # After closing a top-level type object, only continue if the
+                # next non-whitespace char extends the type (`&`, `|`, `[`).
+                # Anything else (especially another `{`) is the enclosing body.
+                j = i + 1
+                while j < n and src[j] in " \t\r\n":
+                    j += 1
+                if j >= n or src[j] not in "&|[":
+                    return j
         elif depth_angle == depth_paren == depth_brace == depth_brack == 0:
             if c in ",;=\n":
                 return i
@@ -332,20 +348,35 @@ def _strip_type_annotations(src: str) -> str:
                 tern_stack.pop()
             out.append(c)
             i += 1
-            # After ')' check for return-type annotation.
-            if c == ")":
+            # After ')' check for return-type annotation. Skip if a ternary
+            # is pending in the enclosing scope — that `:` is the alternative
+            # branch, not a type annotation.
+            if c == ")" and tern_stack[-1] == 0:
                 k = i
                 while k < n and src[k] in " \t":
                     k += 1
                 if k < n and src[k] == ":":
                     end = _scan_type_ref(src, k + 1, allow_brace=_annot_needs_brace(src, k + 1))
-                    i = end
+                    # Only consume if it really looks like a return-type: the
+                    # type must be followed by `{` (body), `;` (abstract), or
+                    # `=>` (arrow).
+                    j = end
+                    while j < n and src[j] in " \t\r\n":
+                        j += 1
+                    if j < n and (src[j] == "{" or src[j] == ";"
+                                  or src[j:j + 2] == "=>"):
+                        i = end
             continue
         if c == "?":
             # Distinguish ternary `?` from `?.`, `??`, and optional-param `?:`.
             nxt = src[i + 1] if i + 1 < n else ""
-            if nxt in ("?", "."):
-                # `??` / `?.` — consume as-is, not a ternary.
+            if nxt == "?":
+                # `??` nullish coalescing — consume BOTH chars atomically.
+                out.append(src[i:i + 2])
+                i += 2
+                continue
+            if nxt == ".":
+                # `?.` optional chaining.
                 out.append(c)
                 i += 1
                 continue
@@ -402,7 +433,9 @@ def _strip_type_annotations(src: str) -> str:
             elif ctx_kind == "brack":
                 is_annotation = False
             if is_annotation:
-                end = _scan_type_ref(src, i + 1, allow_brace=_annot_needs_brace(src, i + 1))
+                # Always allow braces for non-return annotations — terminator
+                # is `,`, `)`, `=`, `;`, or newline, never `{`.
+                end = _scan_type_ref(src, i + 1, allow_brace=True)
                 i = end
                 continue
         out.append(c)
@@ -437,7 +470,8 @@ def _strip_as_casts(src: str) -> str:
             # 'as' must be a standalone word: chars around the match slot are
             # already whitespace, so no further check needed.
             out.append(c)  # keep the leading space
-            end = _scan_type_ref(src, i + 4)
+            # `as` casts can contain inline object types (`as { k: v }`).
+            end = _scan_type_ref(src, i + 4, allow_brace=_annot_needs_brace(src, i + 4))
             i = end
             continue
         out.append(c)

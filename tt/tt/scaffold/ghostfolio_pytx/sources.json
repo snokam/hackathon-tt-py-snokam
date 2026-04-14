@@ -9,6 +9,11 @@
       "py": "app/implementation/portfolio/calculator/roai/portfolio_calculator.py",
       "stub": "app/implementation/portfolio/calculator/roai/portfolio_calculator.py",
       "class_name": "RoaiPortfolioCalculator"
+    },
+    {
+      "ts": "projects/ghostfolio/apps/api/src/app/portfolio/calculator/portfolio-calculator.ts",
+      "py": "app/implementation/_support/_base_portfolio_calculator.py",
+      "class_name": "PortfolioCalculator"
     }
   ]
 }

@@ -164,6 +164,9 @@ class _Parser:
             except ParseError as e:
                 name = self._last_seen_ident_from(start_idx) or "<anon>"
                 failed.append((name, str(e)))
+                # Restore to before the failed attempt so we can reliably scan
+                # to the end of this member (body block or terminating `;`).
+                self.i = start_idx
                 self._skip_class_member()
         self.expect("PUNCT", "}")
         return ClassDecl(name=name_tok.value, base=base, members=members,
@@ -176,25 +179,35 @@ class _Parser:
         return None
 
     def _skip_class_member(self) -> None:
-        # Walk forward past the next top-level `{...}` block, or to a ';'.
-        depth = 0
+        """Advance past one class member.
+
+        We look for the FIRST top-level `{` (method body) or `;` (abstract
+        method / field). On `{`, we balance braces until depth returns to
+        zero. On `;`, we consume it. A bare `}` at depth 0 signals the end
+        of the class body and is left for the outer loop.
+        """
         while not self.eof():
             t = self.peek()
             if t.kind == "PUNCT":
-                if t.value == "{":
-                    depth += 1
-                    self.advance()
-                    continue
                 if t.value == "}":
-                    if depth == 0:
-                        return  # class end; outer loop handles it
-                    depth -= 1
+                    return  # class end
+                if t.value == ";":
                     self.advance()
-                    if depth == 0:
-                        return
-                    continue
-                if t.value == ";" and depth == 0:
-                    self.advance()
+                    return
+                if t.value == "{":
+                    depth = 0
+                    while not self.eof():
+                        tt = self.peek()
+                        if tt.kind == "PUNCT":
+                            if tt.value == "{":
+                                depth += 1
+                            elif tt.value == "}":
+                                depth -= 1
+                                self.advance()
+                                if depth == 0:
+                                    return
+                                continue
+                        self.advance()
                     return
             self.advance()
 
@@ -233,10 +246,18 @@ class _Parser:
 
         if self.check("PUNCT", "("):
             params = self._parse_params()
-            # Residual return-type annotation survived: skip `: ...` until `{`.
+            # Residual return-type annotation survived: skip `: ...` until `{` or `;`.
             if self.check("PUNCT", ":"):
-                while not self.eof() and not self.check("PUNCT", "{"):
+                while not self.eof() and not self.check("PUNCT", "{") \
+                        and not self.check("PUNCT", ";"):
                     self.advance()
+            # Abstract/interface method: signature followed by `;` with no body.
+            if self.match("PUNCT", ";"):
+                return MethodDecl(
+                    name=name, params=params, body=Block(stmts=[]),
+                    is_static=is_static, access=access,
+                    is_constructor=is_constructor, is_async=is_async,
+                )
             body = self._parse_block()
             return MethodDecl(
                 name=name, params=params, body=body,
