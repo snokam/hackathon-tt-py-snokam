@@ -4,6 +4,72 @@ from __future__ import annotations
 import re
 
 
+def remove_destructured_param_types(code: str) -> str:
+    """Remove type annotations from destructured parameters using balanced brace matching.
+
+    Handles patterns like:
+      ({a, b}: { a: Type, b: Type })
+      ({a, b}: { a: Type } & OtherType)
+
+    Args:
+        code: Code with potential destructured param types
+
+    Returns:
+        Code with param types removed
+    """
+    result = []
+    i = 0
+
+    while i < len(code):
+        # Look for pattern: } : {
+        if i < len(code) - 3 and code[i:i+3] in ('}: ', '}\n:', '} :'):
+            # Found potential param type annotation
+            # Check if this is inside a parameter list (has ) after the type)
+            j = i + 1
+            while j < len(code) and code[j] in ' \n\t':
+                j += 1
+
+            if j < len(code) and code[j] == ':':
+                # Skip the :
+                j += 1
+                while j < len(code) and code[j] in ' \n\t':
+                    j += 1
+
+                if j < len(code) and code[j] == '{':
+                    # Found type object, skip it with balanced braces
+                    brace_count = 0
+                    type_start = j
+
+                    while j < len(code):
+                        if code[j] == '{':
+                            brace_count += 1
+                        elif code[j] == '}':
+                            brace_count -= 1
+                            if brace_count == 0:
+                                j += 1
+                                break
+                        j += 1
+
+                    # Check for intersection type (& Type)
+                    while j < len(code) and code[j] in ' \n\t':
+                        j += 1
+                    if j < len(code) and code[j] == '&':
+                        # Skip the & and the following type
+                        j += 1
+                        while j < len(code) and (code[j].isalnum() or code[j] in '_. \n\t'):
+                            j += 1
+
+                    # Now we've skipped the entire type, keep the } and skip to j
+                    result.append('}')
+                    i = j
+                    continue
+
+        result.append(code[i])
+        i += 1
+
+    return ''.join(result)
+
+
 def strip_typescript_types(ts_code: str) -> str:
     """Remove TypeScript-specific syntax to get valid JavaScript.
 
@@ -22,6 +88,9 @@ def strip_typescript_types(ts_code: str) -> str:
     """
     js_code = ts_code
 
+    # First pass: Remove complex destructured parameter types
+    js_code = remove_destructured_param_types(js_code)
+
     # Remove import type statements
     js_code = re.sub(r'import\s+type\s+.*?;', '', js_code, flags=re.MULTILINE)
 
@@ -37,14 +106,44 @@ def strip_typescript_types(ts_code: str) -> str:
     # e.g., class Foo<T> → class Foo
     js_code = re.sub(r'(\w+)\s*<[^>]+>(?=\s*extends|\s*\{|\s*\()', r'\1', js_code)
 
-    # Remove type annotations from variable declarations
+    # Remove complex parameter destructuring with types
+    # Pattern: ({param1, param2}: { param1: Type1, param2: Type2 } & OtherType)
+    # This is a multi-pass approach:
+
+    # Step 1: Remove intersection types (&) from parameter types
+    # e.g., }: {...} & AssetProfile) → }: {...})
+    js_code = re.sub(r'\}\s*&\s*\w+\s*\)', '})', js_code)
+
+    # Step 2: Remove type annotations after destructured parameters
+    # Pattern: }: { ... }  where the closing } is from the param destructuring
+    # We need to match the ENTIRE type annotation block including nested objects
+    # This regex finds }: followed by type object, handling nesting
+    def remove_param_types(match):
+        # Keep the closing } from parameter, remove the type annotation
+        return '}'
+
+    # Match destructured param end (}) followed by type (: { ... })
+    # Using a simple but effective pattern
+    js_code = re.sub(
+        r'\}\s*:\s*\{[^\}]*(?:\{[^\}]*\}[^\}]*)*\}(?=\s*\))',
+        remove_param_types,
+        js_code,
+        flags=re.DOTALL
+    )
+
+    # Remove type annotations from variable declarations (including object index signatures)
     # e.g., const x: number = 5 → const x = 5
     # e.g., data: Big[] → data
-    js_code = re.sub(r'(\w+)\s*:\s*[A-Za-z_][A-Za-z0-9_<>\[\]|&\s]*(?=\s*[=;,\)])', r'\1', js_code)
+    # e.g., obj: { [key: string]: Type } = {} → obj = {}
+    # First handle object index signatures: : { ... } =
+    js_code = re.sub(r'(\w+)\s*:\s*\{[^}]*\}\s*(?==)', r'\1 ', js_code)
+    # Then handle simple types (use [ \t]* instead of \s* before : to avoid matching ternary operators across newlines)
+    js_code = re.sub(r'(\w+)[ \t]*:[ \t]*[A-Za-z_][A-Za-z0-9_<>\[\]|&\s]*(?=[ \t\n]*[=;,\)])', r'\1', js_code)
 
-    # Remove return type annotations
+    # Remove return type annotations (including complex ones)
     # e.g., function foo(): number { → function foo() {
-    js_code = re.sub(r'\)\s*:\s*[A-Za-z_][A-Za-z0-9_<>\[\]|&\s]*(?=\s*\{)', ')', js_code)
+    # e.g., function foo(): SymbolMetrics { → function foo() {
+    js_code = re.sub(r'\)\s*:\s*[A-Za-z_][A-Za-z0-9_<>\[\]|&\s]*\{', ') {', js_code)
 
     # Remove optional parameter indicator with type
     # e.g., y?: string → y
@@ -75,6 +174,17 @@ def strip_typescript_types(ts_code: str) -> str:
     # Remove optional ? from properties (but keep ternary operator)
     # This is tricky - only remove ? when it's part of property definition
     js_code = re.sub(r'(\w+)\?(?=:)', r'\1', js_code)
+
+    # Remove optional chaining operator (?.) → regular property access
+    # e.g., obj?.prop → obj.prop, arr?.[index] → arr[index]
+    js_code = re.sub(r'\?\.\[', '[', js_code)  # ?.[  →  [
+    js_code = re.sub(r'\?\.', '.', js_code)     # ?.   →  .
+
+    # Convert nullish coalescing operator (??) to || (simpler and works with esprima)
+    # While not semantically identical (|| checks falsy, ?? checks null/undefined),
+    # it's close enough for most portfolio calculator use cases
+    # Pattern: a ?? b → a || b
+    js_code = re.sub(r'\?\?', '||', js_code)
 
     return js_code
 

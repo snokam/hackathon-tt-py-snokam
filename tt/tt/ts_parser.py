@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-import esprima
+import esprima  # Using esprima2 package (v5.0.1)
 
 try:
     from .type_stripper import strip_typescript_types
@@ -31,13 +31,19 @@ def parse_typescript(ts_code: str) -> dict[str, Any]:
 
     # Parse with esprima
     try:
-        ast = esprima.parseScript(js_code, {'tolerant': True})
+        # Use parseModule for better ES6+ support (import/export)
+        ast = esprima.parseModule(js_code, {'tolerant': True})
     except Exception as e:
-        print(f"Error parsing TypeScript:")
-        print(f"  {e}")
-        print("\nJavaScript after type stripping (first 500 chars):")
-        print(js_code[:500])
-        raise
+        # Fallback to parseScript if parseModule fails
+        try:
+            ast = esprima.parseScript(js_code, {'tolerant': True})
+        except Exception as e2:
+            print(f"Error parsing TypeScript:")
+            print(f"  parseModule error: {e}")
+            print(f"  parseScript error: {e2}")
+            print("\nJavaScript after type stripping (first 1000 chars):")
+            print(js_code[:1000])
+            raise e2
 
     # Convert to dict (esprima returns objects)
     return ast.toDict()

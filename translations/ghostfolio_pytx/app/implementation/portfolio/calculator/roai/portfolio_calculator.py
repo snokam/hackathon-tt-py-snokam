@@ -76,11 +76,6 @@ class RoaiPortfolioCalculator(PortfolioCalculator):
     def get_dividends(self, group_by: str | None = None) -> dict:
         return {"dividends": []}
 
-    # --- Translated from TypeScript ---
-    def getPerformanceCalculationType(self):
-        return "ROAI"
-    # --- End translated section ---
-
     def evaluate_report(self) -> dict:
         return {
             "xRay": {
