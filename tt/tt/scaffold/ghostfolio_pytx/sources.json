@@ -1,0 +1,14 @@
+{
+  "scaffold_name": "ghostfolio_pytx",
+  "example_root": "translations/ghostfolio_pytx_example",
+  "output_root": "translations/ghostfolio_pytx",
+  "support_dir": "app/implementation/_support",
+  "translations": [
+    {
+      "ts": "projects/ghostfolio/apps/api/src/app/portfolio/calculator/roai/portfolio-calculator.ts",
+      "py": "app/implementation/portfolio/calculator/roai/portfolio_calculator.py",
+      "stub": "app/implementation/portfolio/calculator/roai/portfolio_calculator.py",
+      "class_name": "RoaiPortfolioCalculator"
+    }
+  ]
+}

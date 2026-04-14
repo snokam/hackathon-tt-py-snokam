@@ -1,0 +1,115 @@
+{
+  "imports": {
+    "big.js": {
+      "python": "app.implementation._support.bigjs",
+      "symbols": {"Big": "Big"}
+    },
+    "date-fns": {
+      "python": "app.implementation._support.datefns",
+      "symbols": {
+        "addMilliseconds": "_add_milliseconds",
+        "differenceInDays": "_difference_in_days",
+        "eachYearOfInterval": "_each_year_of_interval",
+        "format": "_date_format",
+        "isBefore": "_is_before",
+        "isThisYear": "_is_this_year"
+      }
+    },
+    "lodash": {
+      "python": "app.implementation._support.lodashish",
+      "symbols": {
+        "cloneDeep": "cloneDeep",
+        "sortBy": "sortBy"
+      }
+    },
+    "@nestjs/common": {
+      "python": "app.implementation._support.nest_logger",
+      "symbols": {"Logger": "Logger"}
+    },
+    "@ghostfolio/api/helper/portfolio.helper": {
+      "python": "app.implementation._support.ghostfolio_helper",
+      "symbols": {"getFactor": "_get_factor"}
+    },
+    "@ghostfolio/common/calculation-helper": {
+      "python": "app.implementation._support.ghostfolio_helper",
+      "symbols": {"getIntervalFromDateRange": "_interval_from_range"}
+    },
+    "@ghostfolio/common/helper": {
+      "python": "app.implementation._support.ghostfolio_helper",
+      "symbols": {"DATE_FORMAT": "_DATE_FORMAT"}
+    },
+    "@ghostfolio/api/app/portfolio/calculator/portfolio-calculator": {
+      "python": "app.wrapper.portfolio.calculator.portfolio_calculator",
+      "symbols": {"PortfolioCalculator": "PortfolioCalculator"}
+    },
+    "@ghostfolio/api/app/portfolio/interfaces/portfolio-order-item.interface": {
+      "python": null,
+      "symbols": {"PortfolioOrderItem": null}
+    },
+    "@ghostfolio/common/interfaces": {
+      "python": null,
+      "symbols": {
+        "AssetProfileIdentifier": null,
+        "SymbolMetrics": null
+      }
+    },
+    "@ghostfolio/common/models": {
+      "python": null,
+      "symbols": {
+        "PortfolioSnapshot": null,
+        "TimelinePosition": null
+      }
+    },
+    "@ghostfolio/common/types": {
+      "python": null,
+      "symbols": {"DateRange": null}
+    },
+    "@ghostfolio/common/types/performance-calculation-type.type": {
+      "python": null,
+      "symbols": {"PerformanceCalculationType": null}
+    }
+  },
+  "methods": {
+    "plus":  {"op": "+"},
+    "minus": {"op": "-"},
+    "times": {"op": "*"},
+    "div":   {"op": "/"},
+    "mul":   {"op": "*"},
+    "eq":    {"op": "=="},
+    "lt":    {"op": "<"},
+    "gt":    {"op": ">"},
+    "lte":   {"op": "<="},
+    "gte":   {"op": ">="},
+    "abs":   {"call": "abs"},
+    "toNumber": {"call": "float"},
+    "toFixed":  {"call": "_big_to_fixed"},
+    "toString": {"call": "str"},
+    "isZero":   {"pyexpr": "$receiver == 0"},
+    "isNeg":    {"pyexpr": "$receiver < 0"},
+    "isPos":    {"pyexpr": "$receiver > 0"}
+  },
+  "calls": {
+    "new Big($x)":              {"py": "Big($x)"},
+    "sortBy($a,$k)":             {"py": "sorted($a, key=$k)"},
+    "cloneDeep($x)":             {"py": "deepcopy($x)"},
+    "isBefore($a,$b)":           {"py": "($a < $b)"},
+    "differenceInDays($a,$b)":   {"py": "(($a - $b).days)"},
+    "format($d,$f)":             {"py": "_date_format($d, $f)"},
+    "addMilliseconds($d,$ms)":   {"py": "($d + timedelta(milliseconds=$ms))"},
+    "eachYearOfInterval($i)":    {"py": "_each_year_of_interval($i)"},
+    "isThisYear($d)":            {"py": "_is_this_year($d)"},
+    "getFactor($x)":             {"py": "_get_factor($x)"},
+    "getIntervalFromDateRange($r)": {"py": "_interval_from_range($r)"}
+  },
+  "identifiers": {
+    "DATE_FORMAT": "_DATE_FORMAT",
+    "null": "None",
+    "undefined": "None",
+    "true": "True",
+    "false": "False"
+  },
+  "literals": {
+    "null": "None",
+    "undefined": "None"
+  }
+}
