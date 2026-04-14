@@ -188,6 +188,37 @@ def _read_regex(cur: _Cursor) -> Tuple[str, Tuple[int, int]]:
     raise LexError(f"Unterminated regex at {start}")
 
 
+def _read_template_expr(cur: _Cursor) -> List[Token]:
+    """Read a balanced ``${...}`` region and return its inner tokens."""
+    depth = 1
+    inner_start = cur.i
+    inner_line = cur.line
+    inner_col = cur.col
+    while not cur.eof() and depth:
+        ch = cur.peek()
+        if ch == "{":
+            depth += 1
+            cur.advance()
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                break
+            cur.advance()
+        elif ch in ("'", '"'):
+            _read_string(cur, ch)
+        elif ch == "`":
+            _read_template(cur)
+        else:
+            cur.advance()
+    inner_src = cur.src[inner_start : cur.i]
+    inner_tokens = tokenize(inner_src, line=inner_line, col=inner_col)
+    if inner_tokens and inner_tokens[-1].kind == "EOF":
+        inner_tokens = inner_tokens[:-1]
+    if not cur.eof() and cur.peek() == "}":
+        cur.advance()
+    return inner_tokens
+
+
 def _read_template(cur: _Cursor) -> Tuple[List[Any], Tuple[int, int]]:
     """Read a template literal. Returns alternating list: [part0, exprToks0,
     part1, exprToks1, ..., partN]."""
@@ -211,39 +242,77 @@ def _read_template(cur: _Cursor) -> Tuple[List[Any], Tuple[int, int]]:
             cur_part = []
             cur.advance()  # $
             cur.advance()  # {
-            # Read balanced up to matching }.
-            depth = 1
-            inner_start = cur.i
-            inner_line = cur.line
-            inner_col = cur.col
-            while not cur.eof() and depth:
-                ch = cur.peek()
-                if ch == "{":
-                    depth += 1
-                    cur.advance()
-                elif ch == "}":
-                    depth -= 1
-                    if depth == 0:
-                        break
-                    cur.advance()
-                elif ch in ("'", '"'):
-                    _read_string(cur, ch)
-                elif ch == "`":
-                    _read_template(cur)
-                else:
-                    cur.advance()
-            inner_src = cur.src[inner_start : cur.i]
-            # Recursively tokenize (without the trailing '}')
-            inner_tokens = tokenize(inner_src, line=inner_line, col=inner_col)
-            # Drop EOF
-            if inner_tokens and inner_tokens[-1].kind == "EOF":
-                inner_tokens = inner_tokens[:-1]
-            parts.append(inner_tokens)
-            if not cur.eof() and cur.peek() == "}":
-                cur.advance()
+            parts.append(_read_template_expr(cur))
             continue
         cur_part.append(cur.advance())
     raise LexError(f"Unterminated template literal at {start}")
+
+
+def _skip_whitespace_or_comment(cur: _Cursor) -> bool:
+    """If the cursor is at whitespace/comment, skip it and return True."""
+    c = cur.peek()
+    if c in (" ", "\t", "\r", "\n"):
+        cur.advance()
+        return True
+    if c == "/" and cur.peek(1) == "/":
+        while not cur.eof() and cur.peek() != "\n":
+            cur.advance()
+        return True
+    if c == "/" and cur.peek(1) == "*":
+        cur.advance()
+        cur.advance()
+        while not cur.eof() and not (cur.peek() == "*" and cur.peek(1) == "/"):
+            cur.advance()
+        if not cur.eof():
+            cur.advance(); cur.advance()
+        return True
+    return False
+
+
+def _try_read_regex(cur: _Cursor, prev: Optional[Token]) -> Optional[Token]:
+    if cur.peek() != "/" or not _regex_allowed(prev):
+        return None
+    try:
+        s, p = _read_regex(cur)
+        return Token("REGEX", s, p)
+    except LexError:
+        # Match original behavior: cursor may have advanced; fall through.
+        return None
+
+
+def _read_punct(cur: _Cursor) -> Optional[Token]:
+    for sym in PUNCT_MULTI:
+        if cur.src.startswith(sym, cur.i):
+            p = cur.pos()
+            for _ in range(len(sym)):
+                cur.advance()
+            return Token("PUNCT", sym, p)
+    c = cur.peek()
+    if c in PUNCT_SINGLE:
+        p = cur.pos()
+        cur.advance()
+        return Token("PUNCT", c, p)
+    return None
+
+
+def _next_token(cur: _Cursor, prev: Optional[Token]) -> Optional[Token]:
+    c = cur.peek()
+    if c in ("'", '"'):
+        s, p = _read_string(cur, c)
+        return Token("STRING", (c, s), p)
+    if c == "`":
+        parts, p = _read_template(cur)
+        return Token("TEMPLATE", parts, p)
+    rx = _try_read_regex(cur, prev)
+    if rx is not None:
+        return rx
+    if c.isdigit() or (c == "." and cur.peek(1).isdigit()):
+        s, p = _read_number(cur)
+        return Token("NUMBER", s, p)
+    if c.isalpha() or c == "_" or c == "$":
+        s, p = _read_ident(cur)
+        return Token("KEYWORD" if s in KEYWORDS else "IDENT", s, p)
+    return _read_punct(cur)
 
 
 def tokenize(src: str, line: int = 1, col: int = 1) -> List[Token]:
@@ -251,90 +320,14 @@ def tokenize(src: str, line: int = 1, col: int = 1) -> List[Token]:
     tokens: List[Token] = []
     prev: Optional[Token] = None
     while not cur.eof():
-        c = cur.peek()
-        # whitespace (not newline)
-        if c in (" ", "\t", "\r"):
+        if _skip_whitespace_or_comment(cur):
+            continue
+        tok = _next_token(cur, prev)
+        if tok is None:
+            # Unknown char — skip with no token; keeps lexer robust.
             cur.advance()
             continue
-        if c == "\n":
-            cur.advance()
-            continue
-        # comments
-        if c == "/" and cur.peek(1) == "/":
-            while not cur.eof() and cur.peek() != "\n":
-                cur.advance()
-            continue
-        if c == "/" and cur.peek(1) == "*":
-            cur.advance()
-            cur.advance()
-            while not cur.eof() and not (cur.peek() == "*" and cur.peek(1) == "/"):
-                cur.advance()
-            if not cur.eof():
-                cur.advance(); cur.advance()
-            continue
-        # strings
-        if c in ("'", '"'):
-            s, p = _read_string(cur, c)
-            tok = Token("STRING", (c, s), p)
-            tokens.append(tok)
-            prev = tok
-            continue
-        # template
-        if c == "`":
-            parts, p = _read_template(cur)
-            tok = Token("TEMPLATE", parts, p)
-            tokens.append(tok)
-            prev = tok
-            continue
-        # regex vs division
-        if c == "/" and _regex_allowed(prev):
-            try:
-                s, p = _read_regex(cur)
-                tok = Token("REGEX", s, p)
-                tokens.append(tok)
-                prev = tok
-                continue
-            except LexError:
-                # fall through to punct handling
-                pass
-        # number
-        if c.isdigit() or (c == "." and cur.peek(1).isdigit()):
-            s, p = _read_number(cur)
-            tok = Token("NUMBER", s, p)
-            tokens.append(tok)
-            prev = tok
-            continue
-        # identifier/keyword
-        if c.isalpha() or c == "_" or c == "$":
-            s, p = _read_ident(cur)
-            kind = "KEYWORD" if s in KEYWORDS else "IDENT"
-            tok = Token(kind, s, p)
-            tokens.append(tok)
-            prev = tok
-            continue
-        # multi-char punct
-        matched = None
-        for sym in PUNCT_MULTI:
-            if cur.src.startswith(sym, cur.i):
-                matched = sym
-                break
-        if matched:
-            p = cur.pos()
-            for _ in range(len(matched)):
-                cur.advance()
-            tok = Token("PUNCT", matched, p)
-            tokens.append(tok)
-            prev = tok
-            continue
-        if c in PUNCT_SINGLE:
-            p = cur.pos()
-            cur.advance()
-            tok = Token("PUNCT", c, p)
-            tokens.append(tok)
-            prev = tok
-            continue
-        # Unknown char — skip with no token; keeps lexer robust.
-        cur.advance()
-
+        tokens.append(tok)
+        prev = tok
     tokens.append(Token("EOF", None, cur.pos()))
     return tokens

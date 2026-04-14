@@ -36,6 +36,17 @@ _BINOPS = {
 _ASSIGN_OPS = {"=", "+=", "-=", "*=", "/=", "%=", "**=", "&&=", "||=", "??=",
                "|=", "&=", "^=", "<<=", ">>="}
 
+# Maps primary-position keywords that produce a simple value. "ident" kind
+# signals that the value is an identifier name rather than a literal.
+_KEYWORD_LITERALS = {
+    "this": ("this", "ident"),
+    "super": ("super", "ident"),
+    "true": (True, "bool"),
+    "false": (False, "bool"),
+    "null": (None, "null"),
+    "undefined": (None, "undefined"),
+}
+
 
 class _Parser:
     def __init__(self, tokens: List[Token]):
@@ -211,8 +222,7 @@ class _Parser:
                     return
             self.advance()
 
-    def _parse_class_member(self) -> Optional[Node]:
-        # Re-strip residual modifiers (preprocessor may miss some combos).
+    def _consume_member_modifiers(self) -> Tuple[str, bool, bool]:
         access = "public"
         is_static = False
         is_async = False
@@ -221,7 +231,7 @@ class _Parser:
             if tok.kind == "KEYWORD" and tok.value in ("static", "async"):
                 if tok.value == "static":
                     is_static = True
-                elif tok.value == "async":
+                else:
                     is_async = True
                 self.advance()
                 continue
@@ -234,37 +244,26 @@ class _Parser:
                 self.advance()
                 continue
             break
+        return access, is_static, is_async
 
-        # Method or field?
-        name_tok = self.peek()
-        if name_tok.kind not in ("IDENT", "KEYWORD"):
-            raise ParseError("class_member", name_tok.pos,
-                             detail=f"unexpected {name_tok}")
-        name = name_tok.value
-        self.advance()
-        is_constructor = name == "constructor"
+    def _parse_method_member(self, name: str, access: str, is_static: bool,
+                             is_async: bool, is_constructor: bool) -> MethodDecl:
+        params = self._parse_params()
+        # Residual return-type annotation survived: skip `: ...` until `{` or `;`.
+        if self.check("PUNCT", ":"):
+            while not self.eof() and not self.check("PUNCT", "{") \
+                    and not self.check("PUNCT", ";"):
+                self.advance()
+        # Abstract/interface method: signature followed by `;` with no body.
+        body = Block(stmts=[]) if self.match("PUNCT", ";") else self._parse_block()
+        return MethodDecl(
+            name=name, params=params, body=body,
+            is_static=is_static, access=access,
+            is_constructor=is_constructor, is_async=is_async,
+        )
 
-        if self.check("PUNCT", "("):
-            params = self._parse_params()
-            # Residual return-type annotation survived: skip `: ...` until `{` or `;`.
-            if self.check("PUNCT", ":"):
-                while not self.eof() and not self.check("PUNCT", "{") \
-                        and not self.check("PUNCT", ";"):
-                    self.advance()
-            # Abstract/interface method: signature followed by `;` with no body.
-            if self.match("PUNCT", ";"):
-                return MethodDecl(
-                    name=name, params=params, body=Block(stmts=[]),
-                    is_static=is_static, access=access,
-                    is_constructor=is_constructor, is_async=is_async,
-                )
-            body = self._parse_block()
-            return MethodDecl(
-                name=name, params=params, body=body,
-                is_static=is_static, access=access,
-                is_constructor=is_constructor, is_async=is_async,
-            )
-
+    def _parse_field_member(self, name: str, access: str,
+                            is_static: bool) -> FieldDecl:
         # Field declaration. Skip residual type annotation `: <Type>`.
         if self.match("PUNCT", ":"):
             while not self.eof() and not (
@@ -278,6 +277,21 @@ class _Parser:
         self.match("PUNCT", ";")
         return FieldDecl(name=name, type_hint=None, init=init,
                          access=access, is_static=is_static)
+
+    def _parse_class_member(self) -> Optional[Node]:
+        access, is_static, is_async = self._consume_member_modifiers()
+        name_tok = self.peek()
+        if name_tok.kind not in ("IDENT", "KEYWORD"):
+            raise ParseError("class_member", name_tok.pos,
+                             detail=f"unexpected {name_tok}")
+        name = name_tok.value
+        self.advance()
+        is_constructor = name == "constructor"
+        if self.check("PUNCT", "("):
+            return self._parse_method_member(
+                name, access, is_static, is_async, is_constructor,
+            )
+        return self._parse_field_member(name, access, is_static)
 
     # ---------------- params ----------------
     def _parse_params(self) -> List[Param]:
@@ -316,51 +330,45 @@ class _Parser:
             default = self._parse_assignment()
         return Param(name=tok.value, default=default)
 
-    def _parse_destructure_pattern(self, kind: str) -> Destructure:
-        if kind == "object":
-            self.expect("PUNCT", "{")
-            targets: List[str] = []
-            while not self.check("PUNCT", "}") and not self.eof():
-                self.match("PUNCT", "...")
-                # Accept `name` or `name: alias` (alias becomes target)
-                if self.peek().kind in ("IDENT", "KEYWORD"):
-                    key = self.advance().value
-                    if self.match("PUNCT", ":"):
-                        # alias or nested
-                        if self.peek().kind in ("IDENT", "KEYWORD"):
-                            targets.append(self.advance().value)
-                        else:
-                            # nested — skip
-                            self._skip_balanced_in_destructure()
-                    else:
-                        targets.append(key)
-                    # default
-                    if self.match("PUNCT", "="):
-                        self._parse_assignment()
-                else:
-                    # skip unknown
-                    self.advance()
-                if not self.match("PUNCT", ","):
-                    break
-            self.expect("PUNCT", "}")
-            return Destructure(kind="object", targets=targets)
-        else:
-            self.expect("PUNCT", "[")
-            targets: List[str] = []
-            while not self.check("PUNCT", "]") and not self.eof():
-                self.match("PUNCT", "...")
+    def _parse_object_destructure_entry(self, targets: List[str]) -> None:
+        self.match("PUNCT", "...")
+        if self.peek().kind in ("IDENT", "KEYWORD"):
+            key = self.advance().value
+            if self.match("PUNCT", ":"):
                 if self.peek().kind in ("IDENT", "KEYWORD"):
                     targets.append(self.advance().value)
-                    if self.match("PUNCT", "="):
-                        self._parse_assignment()
-                elif self.check("PUNCT", ","):
-                    targets.append("_")
                 else:
-                    self.advance()
-                if not self.match("PUNCT", ","):
-                    break
-            self.expect("PUNCT", "]")
-            return Destructure(kind="array", targets=targets)
+                    self._skip_balanced_in_destructure()
+            else:
+                targets.append(key)
+            if self.match("PUNCT", "="):
+                self._parse_assignment()
+        else:
+            self.advance()
+
+    def _parse_array_destructure_entry(self, targets: List[str]) -> None:
+        self.match("PUNCT", "...")
+        if self.peek().kind in ("IDENT", "KEYWORD"):
+            targets.append(self.advance().value)
+            if self.match("PUNCT", "="):
+                self._parse_assignment()
+        elif self.check("PUNCT", ","):
+            targets.append("_")
+        else:
+            self.advance()
+
+    def _parse_destructure_pattern(self, kind: str) -> Destructure:
+        open_p, close_p = ("{", "}") if kind == "object" else ("[", "]")
+        entry = (self._parse_object_destructure_entry if kind == "object"
+                 else self._parse_array_destructure_entry)
+        self.expect("PUNCT", open_p)
+        targets: List[str] = []
+        while not self.check("PUNCT", close_p) and not self.eof():
+            entry(targets)
+            if not self.match("PUNCT", ","):
+                break
+        self.expect("PUNCT", close_p)
+        return Destructure(kind=kind, targets=targets)
 
     def _skip_balanced_in_destructure(self) -> None:
         # Swallow one nested pattern.
@@ -388,6 +396,16 @@ class _Parser:
         self.expect("PUNCT", "}")
         return Block(stmts=stmts)
 
+    def _parse_break(self) -> Break:
+        self.advance()
+        self.match("PUNCT", ";")
+        return Break()
+
+    def _parse_continue(self) -> Continue:
+        self.advance()
+        self.match("PUNCT", ";")
+        return Continue()
+
     def _parse_statement(self) -> Node:
         t = self.peek()
         if t.kind == "PUNCT" and t.value == "{":
@@ -396,34 +414,11 @@ class _Parser:
             self.advance()
             return ExprStmt(expr=Literal(value=None, kind="null"))
         if t.kind == "KEYWORD":
-            v = t.value
-            if v in ("const", "let", "var"):
+            handler = _STMT_DISPATCH.get(t.value)
+            if handler is not None:
+                return handler(self)
+            if t.value in ("const", "let", "var"):
                 return self._parse_var_decl()
-            if v == "if":
-                return self._parse_if()
-            if v == "for":
-                return self._parse_for()
-            if v == "while":
-                return self._parse_while()
-            if v == "return":
-                return self._parse_return()
-            if v == "throw":
-                return self._parse_throw()
-            if v == "try":
-                return self._parse_try()
-            if v == "break":
-                self.advance()
-                self.match("PUNCT", ";")
-                return Break()
-            if v == "continue":
-                self.advance()
-                self.match("PUNCT", ";")
-                return Continue()
-            if v == "function":
-                return self._parse_function_decl()
-            if v == "switch":
-                return self._parse_switch()
-        # Expression statement.
         expr = self._parse_expression()
         self.match("PUNCT", ";")
         return ExprStmt(expr=expr)
@@ -475,62 +470,57 @@ class _Parser:
         body = self._parse_statement()
         return While(cond=cond, body=body)
 
+    def _parse_for_binding(self) -> object:
+        if self.check("PUNCT", "{"):
+            return self._parse_destructure_pattern("object")
+        if self.check("PUNCT", "["):
+            return self._parse_destructure_pattern("array")
+        tk = self.expect("IDENT")
+        return Ident(name=tk.value)
+
+    def _try_parse_for_of(self, var_name: object) -> Optional[ForOf]:
+        if not (self.peek().kind == "KEYWORD"
+                and self.peek().value in ("of", "in")):
+            return None
+        is_in = self.advance().value == "in"
+        iter_expr = self._parse_expression()
+        self.expect("PUNCT", ")")
+        body = self._parse_statement()
+        return ForOf(var_name=var_name, iter=iter_expr, body=body, is_in=is_in)
+
+    def _parse_for_init_decl(self) -> Tuple[Optional[Node], Optional[ForOf]]:
+        decl_kind = self.advance().value
+        binding = self._parse_for_binding()
+        for_of = self._try_parse_for_of(binding)
+        if for_of is not None:
+            return None, for_of
+        initial = self._parse_assignment() if self.match("PUNCT", "=") else None
+        return VarDecl(kind=decl_kind, name=binding, init=initial), None
+
+    def _parse_for_init_expr(self) -> Tuple[Optional[Node], Optional[ForOf]]:
+        if self.check("PUNCT", ";"):
+            return None, None
+        init_expr = self._parse_expression()
+        for_of = self._try_parse_for_of(init_expr)
+        if for_of is not None:
+            return None, for_of
+        return ExprStmt(expr=init_expr), None
+
     def _parse_for(self) -> Node:
         self.expect("KEYWORD", "for")
         self.expect("PUNCT", "(")
-        # Peek: for-of / for-in / for-C
-        save = self.i
-        init_node: Optional[Node] = None
-        is_decl = False
-        decl_kind = None
         if self.peek().kind == "KEYWORD" and self.peek().value in (
             "const", "let", "var",
         ):
-            decl_kind = self.advance().value
-            is_decl = True
-            # read one binding
-            if self.check("PUNCT", "{"):
-                binding: object = self._parse_destructure_pattern("object")
-            elif self.check("PUNCT", "["):
-                binding = self._parse_destructure_pattern("array")
-            else:
-                tk = self.expect("IDENT")
-                binding = Ident(name=tk.value)
-            # for-of / for-in
-            if self.peek().kind == "KEYWORD" and self.peek().value in ("of", "in"):
-                is_in = self.advance().value == "in"
-                iter_expr = self._parse_expression()
-                self.expect("PUNCT", ")")
-                body = self._parse_statement()
-                return ForOf(var_name=binding, iter=iter_expr, body=body,
-                             is_in=is_in)
-            # Otherwise it's a C-style for; assemble init
-            if self.match("PUNCT", "="):
-                initial = self._parse_assignment()
-                init_node = VarDecl(kind=decl_kind, name=binding, init=initial)
-            else:
-                init_node = VarDecl(kind=decl_kind, name=binding, init=None)
+            init_node, for_of = self._parse_for_init_decl()
         else:
-            # Either empty init or expression
-            if not self.check("PUNCT", ";"):
-                init_expr = self._parse_expression()
-                # for (x of y)
-                if self.peek().kind == "KEYWORD" and self.peek().value in ("of", "in"):
-                    is_in = self.advance().value == "in"
-                    iter_expr = self._parse_expression()
-                    self.expect("PUNCT", ")")
-                    body = self._parse_statement()
-                    return ForOf(var_name=init_expr, iter=iter_expr, body=body,
-                                 is_in=is_in)
-                init_node = ExprStmt(expr=init_expr)
+            init_node, for_of = self._parse_for_init_expr()
+        if for_of is not None:
+            return for_of
         self.expect("PUNCT", ";")
-        cond = None
-        if not self.check("PUNCT", ";"):
-            cond = self._parse_expression()
+        cond = None if self.check("PUNCT", ";") else self._parse_expression()
         self.expect("PUNCT", ";")
-        update = None
-        if not self.check("PUNCT", ")"):
-            update = self._parse_expression()
+        update = None if self.check("PUNCT", ")") else self._parse_expression()
         self.expect("PUNCT", ")")
         body = self._parse_statement()
         return ForC(init=init_node, cond=cond, update=update, body=body)
@@ -681,40 +671,44 @@ class _Parser:
             return UnaryOp(op=t.value, operand=expr, prefix=False)
         return expr
 
+    def _parse_member_access(self, expr: Node) -> Node:
+        prop_tok = self.peek()
+        if prop_tok.kind not in ("IDENT", "KEYWORD"):
+            raise ParseError("member", prop_tok.pos)
+        self.advance()
+        return Member(obj=expr, prop=prop_tok.value, computed=False)
+
+    def _parse_optional_chain(self, expr: Node) -> Node:
+        prop_tok = self.peek()
+        if prop_tok.kind in ("IDENT", "KEYWORD"):
+            self.advance()
+            return Member(obj=expr, prop=prop_tok.value, computed=False)
+        if self.check("PUNCT", "("):
+            return Call(callee=expr, args=self._parse_call_args())
+        if self.check("PUNCT", "["):
+            self.advance()
+            key = self._parse_expression()
+            self.expect("PUNCT", "]")
+            return Index(obj=expr, key=key)
+        raise ParseError("optional_chain", prop_tok.pos)
+
+    def _parse_index(self, expr: Node) -> Node:
+        key = self._parse_expression()
+        self.expect("PUNCT", "]")
+        return Index(obj=expr, key=key)
+
     def _parse_call(self) -> Node:
         expr = self._parse_new_or_primary()
         while True:
             if self.match("PUNCT", "."):
-                prop_tok = self.peek()
-                if prop_tok.kind in ("IDENT", "KEYWORD"):
-                    self.advance()
-                    expr = Member(obj=expr, prop=prop_tok.value, computed=False)
-                else:
-                    raise ParseError("member", prop_tok.pos)
+                expr = self._parse_member_access(expr)
             elif self.match("PUNCT", "?."):
-                prop_tok = self.peek()
-                if prop_tok.kind in ("IDENT", "KEYWORD"):
-                    self.advance()
-                    expr = Member(obj=expr, prop=prop_tok.value, computed=False)
-                elif self.check("PUNCT", "("):
-                    args = self._parse_call_args()
-                    expr = Call(callee=expr, args=args)
-                elif self.check("PUNCT", "["):
-                    self.advance()
-                    key = self._parse_expression()
-                    self.expect("PUNCT", "]")
-                    expr = Index(obj=expr, key=key)
-                else:
-                    raise ParseError("optional_chain", prop_tok.pos)
+                expr = self._parse_optional_chain(expr)
             elif self.check("PUNCT", "("):
-                args = self._parse_call_args()
-                expr = Call(callee=expr, args=args)
+                expr = Call(callee=expr, args=self._parse_call_args())
             elif self.match("PUNCT", "["):
-                key = self._parse_expression()
-                self.expect("PUNCT", "]")
-                expr = Index(obj=expr, key=key)
+                expr = self._parse_index(expr)
             elif self.check("TEMPLATE"):
-                # Tagged template — treat as call(templatestring).
                 tmpl = self._parse_primary()
                 expr = Call(callee=expr, args=[tmpl])
             else:
@@ -746,89 +740,87 @@ class _Parser:
             return NewExpr(callee=callee, args=args)
         return self._parse_primary()
 
+    def _parse_function_expression(self) -> Arrow:
+        self.advance()
+        if self.peek().kind == "IDENT":
+            self.advance()
+        params = self._parse_params()
+        body = self._parse_block()
+        return Arrow(params=params, body=body, expr_body=False)
+
+    def _parse_async_expression(self, t: Token) -> Node:
+        self.advance()
+        if self.check("PUNCT", "("):
+            return self._parse_paren_or_arrow()
+        if self.peek().kind == "IDENT":
+            name = self.advance().value
+            if self.match("PUNCT", "=>"):
+                body = self._parse_arrow_body()
+                return Arrow(params=[Param(name=name)], body=body,
+                             expr_body=not isinstance(body, Block))
+        raise ParseError("async_expr", t.pos)
+
+    def _parse_primary_keyword(self, t: Token) -> Node:
+        literal = _KEYWORD_LITERALS.get(t.value)
+        if literal is not None:
+            self.advance()
+            value, kind = literal
+            if kind in ("ident",):
+                return Ident(name=value)
+            return Literal(value=value, kind=kind)
+        if t.value == "function":
+            return self._parse_function_expression()
+        if t.value == "async":
+            return self._parse_async_expression(t)
+        if t.value == "new":
+            return self._parse_new_or_primary()
+        raise ParseError("primary", t.pos, detail=f"unexpected {t}")
+
+    def _parse_ident_primary(self, t: Token) -> Node:
+        self.advance()
+        if self.check("PUNCT", "=>"):
+            self.advance()
+            body = self._parse_arrow_body()
+            return Arrow(params=[Param(name=t.value)], body=body,
+                         expr_body=not isinstance(body, Block))
+        return Ident(name=t.value)
+
+    def _parse_template_primary(self, t: Token) -> Template:
+        self.advance()
+        str_parts: List[str] = []
+        expr_parts: List[Node] = []
+        for idx, chunk in enumerate(t.value):
+            if idx % 2 == 0:
+                str_parts.append(chunk)
+            else:
+                sub = _Parser(list(chunk) + [Token("EOF", None, (0, 0))])
+                try:
+                    expr_parts.append(sub._parse_expression())
+                except ParseError:
+                    expr_parts.append(Literal(value="", kind="string"))
+        return Template(parts=str_parts, exprs=expr_parts)
+
     def _parse_primary(self) -> Node:
         t = self.peek()
-        # Parenthesized expression or arrow function
-        if t.kind == "PUNCT" and t.value == "(":
-            return self._parse_paren_or_arrow()
-        if t.kind == "PUNCT" and t.value == "[":
-            return self._parse_array()
-        if t.kind == "PUNCT" and t.value == "{":
-            return self._parse_object()
+        if t.kind == "PUNCT":
+            if t.value == "(":
+                return self._parse_paren_or_arrow()
+            if t.value == "[":
+                return self._parse_array()
+            if t.value == "{":
+                return self._parse_object()
         if t.kind == "KEYWORD":
-            if t.value == "this":
-                self.advance()
-                return Ident(name="this")
-            if t.value == "super":
-                self.advance()
-                return Ident(name="super")
-            if t.value == "true":
-                self.advance()
-                return Literal(value=True, kind="bool")
-            if t.value == "false":
-                self.advance()
-                return Literal(value=False, kind="bool")
-            if t.value == "null":
-                self.advance()
-                return Literal(value=None, kind="null")
-            if t.value == "undefined":
-                self.advance()
-                return Literal(value=None, kind="undefined")
-            if t.value == "function":
-                # Function expression: function [name]?(params){ body }
-                self.advance()
-                if self.peek().kind == "IDENT":
-                    self.advance()
-                params = self._parse_params()
-                body = self._parse_block()
-                return Arrow(params=params, body=body, expr_body=False)
-            if t.value == "async":
-                # async arrow
-                self.advance()
-                if self.check("PUNCT", "("):
-                    return self._parse_paren_or_arrow()
-                # async ident =>
-                if self.peek().kind == "IDENT":
-                    name = self.advance().value
-                    if self.match("PUNCT", "=>"):
-                        body = self._parse_arrow_body()
-                        return Arrow(params=[Param(name=name)], body=body,
-                                     expr_body=not isinstance(body, Block))
-                raise ParseError("async_expr", t.pos)
-            if t.value == "new":
-                return self._parse_new_or_primary()
+            return self._parse_primary_keyword(t)
         if t.kind == "IDENT":
-            self.advance()
-            # arrow with single ident param: x => ...
-            if self.check("PUNCT", "=>"):
-                self.advance()
-                body = self._parse_arrow_body()
-                return Arrow(params=[Param(name=t.value)], body=body,
-                             expr_body=not isinstance(body, Block))
-            return Ident(name=t.value)
+            return self._parse_ident_primary(t)
         if t.kind == "NUMBER":
             self.advance()
             return Literal(value=t.value, kind="number")
         if t.kind == "STRING":
             self.advance()
-            # t.value is (quote, content)
             return Literal(value=t.value[1], kind="string")
         if t.kind == "TEMPLATE":
-            self.advance()
-            parts_raw = t.value
-            str_parts: List[str] = []
-            expr_parts: List[Node] = []
-            for idx, chunk in enumerate(parts_raw):
-                if idx % 2 == 0:
-                    str_parts.append(chunk)
-                else:
-                    # chunk is a list of tokens for the embedded expression
-                    sub = _Parser(list(chunk) + [Token("EOF", None, (0, 0))])
-                    try:
-                        expr_parts.append(sub._parse_expression())
-                    except ParseError:
-                        expr_parts.append(Literal(value="", kind="string"))
-            return Template(parts=str_parts, exprs=expr_parts)
+            return self._parse_template_primary(t)
         if t.kind == "REGEX":
             self.advance()
             return Literal(value=t.value, kind="regex")
@@ -890,6 +882,35 @@ class _Parser:
         self.expect("PUNCT", "]")
         return Array(items=items)
 
+    def _parse_object_key(self) -> object:
+        key_tok = self.peek()
+        if key_tok.kind == "STRING":
+            self.advance()
+            return key_tok.value[1]
+        if key_tok.kind == "NUMBER":
+            self.advance()
+            return key_tok.value
+        if key_tok.kind == "PUNCT" and key_tok.value == "[":
+            self.advance()
+            key = self._parse_assignment()
+            self.expect("PUNCT", "]")
+            return key
+        if key_tok.kind in ("IDENT", "KEYWORD"):
+            self.advance()
+            return key_tok.value
+        raise ParseError("object_key", key_tok.pos, detail=f"unexpected {key_tok}")
+
+    def _parse_object_value(self, key: object, key_pos: Tuple[int, int]) -> Node:
+        if self.check("PUNCT", "("):
+            params = self._parse_params()
+            body = self._parse_block()
+            return Arrow(params=params, body=body, expr_body=False)
+        if self.match("PUNCT", ":"):
+            return self._parse_assignment()
+        if isinstance(key, str):
+            return Ident(name=key)
+        raise ParseError("object_shorthand", key_pos)
+
     def _parse_object(self) -> Object:
         self.expect("PUNCT", "{")
         pairs: List[Tuple[object, Node]] = []
@@ -899,42 +920,32 @@ class _Parser:
                 if not self.match("PUNCT", ","):
                     break
                 continue
-            key_tok = self.peek()
-            key: object
-            if key_tok.kind == "STRING":
-                self.advance()
-                key = key_tok.value[1]
-            elif key_tok.kind == "NUMBER":
-                self.advance()
-                key = key_tok.value
-            elif key_tok.kind == "PUNCT" and key_tok.value == "[":
-                self.advance()
-                key = self._parse_assignment()
-                self.expect("PUNCT", "]")
-            elif key_tok.kind in ("IDENT", "KEYWORD"):
-                self.advance()
-                key = key_tok.value
-            else:
-                raise ParseError("object_key", key_tok.pos,
-                                 detail=f"unexpected {key_tok}")
-            # Shorthand method: key(params) { body }
-            if self.check("PUNCT", "("):
-                params = self._parse_params()
-                body = self._parse_block()
-                value: Node = Arrow(params=params, body=body, expr_body=False)
-            elif self.match("PUNCT", ":"):
-                value = self._parse_assignment()
-            else:
-                # Shorthand property
-                if isinstance(key, str):
-                    value = Ident(name=key)
-                else:
-                    raise ParseError("object_shorthand", key_tok.pos)
+            key_pos = self.peek().pos
+            key = self._parse_object_key()
+            value = self._parse_object_value(key, key_pos)
             pairs.append((key, value))
             if not self.match("PUNCT", ","):
                 break
         self.expect("PUNCT", "}")
         return Object(pairs=pairs)
+
+
+# ------------- statement keyword dispatch -------------
+_STMT_DISPATCH: dict = {
+    "if": _Parser._parse_if,
+    "for": _Parser._parse_for,
+    "while": _Parser._parse_while,
+    "return": _Parser._parse_return,
+    "throw": _Parser._parse_throw,
+    "try": _Parser._parse_try,
+    "break": _Parser._parse_break,
+    "continue": _Parser._parse_continue,
+    "function": _Parser._parse_function_decl,
+    "switch": _Parser._parse_switch,
+    "const": _Parser._parse_var_decl,
+    "let": _Parser._parse_var_decl,
+    "var": _Parser._parse_var_decl,
+}
 
 
 # ------------- per-method isolation wrapper -------------

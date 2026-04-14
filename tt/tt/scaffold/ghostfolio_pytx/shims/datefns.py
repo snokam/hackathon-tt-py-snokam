@@ -1,16 +1,18 @@
 """Minimal date-fns shim. Stdlib only."""
 from __future__ import annotations
 
+import re
 from datetime import date, datetime, timedelta
 
-_TOKENS = [
-    ("yyyy", "%Y"),
-    ("MM", "%m"),
-    ("dd", "%d"),
-    ("HH", "%H"),
-    ("mm", "%M"),
-    ("ss", "%S"),
-]
+_TOKEN_MAP = {
+    "yyyy": "%Y",
+    "MM": "%m",
+    "dd": "%d",
+    "HH": "%H",
+    "mm": "%M",
+    "ss": "%S",
+}
+_TOKEN_RE = re.compile("|".join(sorted(_TOKEN_MAP, key=len, reverse=True)))
 
 
 def _to_dt(d):
@@ -29,20 +31,7 @@ def _to_dt(d):
 def _date_format(d, fmt):
     """Translate date-fns tokens to strftime, preserving non-token text."""
     dt = _to_dt(d)
-    out = []
-    i = 0
-    while i < len(fmt):
-        matched = False
-        for tok, repl in _TOKENS:
-            if fmt.startswith(tok, i):
-                out.append(dt.strftime(repl))
-                i += len(tok)
-                matched = True
-                break
-        if not matched:
-            out.append(fmt[i])
-            i += 1
-    return "".join(out)
+    return _TOKEN_RE.sub(lambda m: dt.strftime(_TOKEN_MAP[m.group(0)]), fmt)
 
 
 def _each_year_of_interval(interval):

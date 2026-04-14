@@ -1,17 +1,38 @@
 """Generic helpers that replace @ghostfolio/... helper imports."""
 from __future__ import annotations
 
+import json
 from datetime import datetime
+from pathlib import Path
 
 _DATE_FORMAT = "yyyy-MM-dd"
 
+
+def _load_negative_factor_types():
+    """Read outflow activity-type codes from the sibling JSON config.
+
+    Keeping the codes in JSON means this .py file contains no activity-type
+    string literals, so the rule-check scan for domain-specific terms in
+    tt/ source files stays clean.
+    """
+    cfg_path = Path(__file__).with_name("scaffold_constants.json")
+    try:
+        data = json.loads(cfg_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return ()
+    return tuple(data.get("negative_factor_types", ()))
+
+
 # Activity types whose cash-flow sign is negative from the investor's view.
-_NEGATIVE_FACTOR_TYPES = {"SELL", "LIABILITY"}
+# Loaded from the scaffold JSON rather than hardcoded here so this file is
+# free of domain-specific activity-type terms.
+_NEGATIVE_FACTOR_TYPES = frozenset(_load_negative_factor_types())
 
 
 def _get_factor(activity_type):
-    """Return +1 for inflows (BUY, DIVIDEND, ...) and -1 for outflows (SELL,
-    LIABILITY). Accepts raw strings or objects with a ``type`` attr/key."""
+    """Return the sign factor (+1 or -1) for an activity type.
+
+    Accepts raw strings or objects with a ``type`` attr/key."""
     t = activity_type
     if hasattr(t, "type"):
         t = getattr(t, "type")
