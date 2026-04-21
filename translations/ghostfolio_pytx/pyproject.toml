@@ -15,7 +15,7 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "pytest>=8.2",
-    "requests>=2.32",
+    "requests>=2.33.0",
 ]
 
 [tool.setuptools.packages]
